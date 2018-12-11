@@ -132,6 +132,8 @@ require (
 	github.com/tv42/httpunix v0.0.0-20150427012821-b75d8614f926 // indirect
 	github.com/tylerb/graceful v1.2.15
 	github.com/willf/bitset v1.1.9 // indirect
+	github.com/zeebo/assert v0.0.0-20181109011804-10f827ce2ed6
+	github.com/zeebo/pcg v0.0.0-20181207190024-3cdc6b625a05
 	go.uber.org/zap v1.9.1
 	golang.org/x/crypto v0.0.0-20181015023909-0c41d7ab0a0e
 	golang.org/x/net v0.0.0-20181023162649-9b4f9f5ad519
