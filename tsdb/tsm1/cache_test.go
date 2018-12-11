@@ -898,7 +898,7 @@ func (s *TestStore) count() int                                     { return s.c
 var fvSize = uint64(NewValue(1, float64(1)).Size())
 
 func BenchmarkCacheFloatEntries(b *testing.B) {
-	cache := NewCache(uint64(b.N) * fvSize)
+	cache := NewCache(uint64(b.N)*fvSize + 4) // 4 is len("test")
 	vals := make([][]Value, b.N)
 	for i := 0; i < b.N; i++ {
 		vals[i] = []Value{NewValue(1, float64(i))}

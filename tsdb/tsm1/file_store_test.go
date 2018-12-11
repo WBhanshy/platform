@@ -2611,7 +2611,7 @@ func TestFileStore_Apply(t *testing.T) {
 	}
 
 	var n int64
-	if err := fs.Apply(func(r tsm1.TSMFile) error {
+	if err := fs.Apply(func(r *tsm1.TSMReader) error {
 		atomic.AddInt64(&n, 1)
 		return nil
 	}); err != nil {

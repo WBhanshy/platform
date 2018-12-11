@@ -1868,7 +1868,7 @@ func TestTSMReader_References(t *testing.T) {
 func BenchmarkIndirectIndex_UnmarshalBinary(b *testing.B) {
 	index := NewIndexWriter()
 	for i := 0; i < 100000; i++ {
-		index.Add([]byte(fmt.Sprintf("cpu-%d", i)), BlockFloat64, int64(i*2), int64(i*2+1), 10, 100)
+		index.Add([]byte(fmt.Sprintf("cpu-%06d", i)), BlockFloat64, int64(i*2), int64(i*2+1), 10, 100)
 	}
 
 	bytes, err := index.MarshalBinary()
@@ -1909,6 +1909,7 @@ func mustMakeIndex(tb testing.TB, keys, blocks int) *indirectIndex {
 
 func BenchmarkIndirectIndex_Entries(b *testing.B) {
 	indirect := mustMakeIndex(b, 1000, 1000)
+	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
@@ -1919,10 +1920,11 @@ func BenchmarkIndirectIndex_Entries(b *testing.B) {
 func BenchmarkIndirectIndex_ReadEntries(b *testing.B) {
 	var cache []IndexEntry
 	indirect := mustMakeIndex(b, 1000, 1000)
+	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		indirect.ReadEntries([]byte("cpu-001"), &cache)
+		cache = indirect.ReadEntries([]byte("cpu-001"), cache)
 	}
 }
 

@@ -24,7 +24,6 @@ import (
 	"github.com/influxdata/platform/pkg/bytesutil"
 	"github.com/influxdata/platform/pkg/limiter"
 	"github.com/influxdata/platform/pkg/metrics"
-	"github.com/influxdata/platform/query"
 	"github.com/influxdata/platform/tsdb"
 	"github.com/influxdata/platform/tsdb/tsi1"
 	"github.com/prometheus/client_golang/prometheus"
@@ -803,7 +802,7 @@ func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 	}
 
 	// Run the delete on each TSM file in parallel
-	if err := e.FileStore.Apply(func(r TSMFile) error {
+	if err := e.FileStore.Apply(func(r *TSMReader) error {
 		// See if this TSM file contains the keys and time range
 		minKey, maxKey := seriesKeys[0], seriesKeys[len(seriesKeys)-1]
 		tsmMin, tsmMax := r.KeyRange()
@@ -883,7 +882,7 @@ func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 
 	// Apply runs this func concurrently.  The seriesKeys slice is mutated concurrently
 	// by different goroutines setting positions to nil.
-	if err := e.FileStore.Apply(func(r TSMFile) error {
+	if err := e.FileStore.Apply(func(r *TSMReader) error {
 		n := r.KeyCount()
 		var j int
 
@@ -1629,78 +1628,6 @@ func (e *Engine) cleanupTempTSMFiles() error {
 // KeyCursor returns a KeyCursor for the given key starting at time t.
 func (e *Engine) KeyCursor(ctx context.Context, key []byte, t int64, ascending bool) *KeyCursor {
 	return e.FileStore.KeyCursor(ctx, key, t, ascending)
-}
-
-// IteratorCost produces the cost of an iterator.
-func (e *Engine) IteratorCost(measurement string, opt query.IteratorOptions) (query.IteratorCost, error) {
-	// Determine if this measurement exists. If it does not, then no shards are
-	// accessed to begin with.
-	if exists, err := e.index.MeasurementExists([]byte(measurement)); err != nil {
-		return query.IteratorCost{}, err
-	} else if !exists {
-		return query.IteratorCost{}, nil
-	}
-
-	tagSets, err := e.index.TagSets([]byte(measurement), opt)
-	if err != nil {
-		return query.IteratorCost{}, err
-	}
-
-	// Attempt to retrieve the ref from the main expression (if it exists).
-	var ref *influxql.VarRef
-	if opt.Expr != nil {
-		if v, ok := opt.Expr.(*influxql.VarRef); ok {
-			ref = v
-		} else if call, ok := opt.Expr.(*influxql.Call); ok {
-			if len(call.Args) > 0 {
-				ref, _ = call.Args[0].(*influxql.VarRef)
-			}
-		}
-	}
-
-	// Count the number of series concatenated from the tag set.
-	cost := query.IteratorCost{NumShards: 1}
-	for _, t := range tagSets {
-		cost.NumSeries += int64(len(t.SeriesKeys))
-		for i, key := range t.SeriesKeys {
-			// Retrieve the cost for the main expression (if it exists).
-			if ref != nil {
-				c := e.seriesCost(key, ref.Val, opt.StartTime, opt.EndTime)
-				cost = cost.Combine(c)
-			}
-
-			// Retrieve the cost for every auxiliary field since these are also
-			// iterators that we may have to look through.
-			// We may want to separate these though as we are unlikely to incur
-			// anywhere close to the full costs of the auxiliary iterators because
-			// many of the selected values are usually skipped.
-			for _, ref := range opt.Aux {
-				c := e.seriesCost(key, ref.Val, opt.StartTime, opt.EndTime)
-				cost = cost.Combine(c)
-			}
-
-			// Retrieve the expression names in the condition (if there is a condition).
-			// We will also create cursors for these too.
-			if t.Filters[i] != nil {
-				refs := influxql.ExprNames(t.Filters[i])
-				for _, ref := range refs {
-					c := e.seriesCost(key, ref.Val, opt.StartTime, opt.EndTime)
-					cost = cost.Combine(c)
-				}
-			}
-		}
-	}
-	return cost, nil
-}
-
-func (e *Engine) seriesCost(seriesKey, field string, tmin, tmax int64) query.IteratorCost {
-	key := SeriesFieldKeyBytes(seriesKey, field)
-	c := e.FileStore.Cost(key, tmin, tmax)
-
-	// Retrieve the range of values within the cache.
-	cacheValues := e.Cache.Values(key)
-	c.CachedValues = int64(len(cacheValues.Include(tmin, tmax)))
-	return c
 }
 
 // SeriesFieldKey combine a series key and field name for a unique string to be hashed to a numeric ID.

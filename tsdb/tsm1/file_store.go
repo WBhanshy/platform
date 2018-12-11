@@ -20,8 +20,6 @@ import (
 	"github.com/influxdata/platform/pkg/file"
 	"github.com/influxdata/platform/pkg/limiter"
 	"github.com/influxdata/platform/pkg/metrics"
-	"github.com/influxdata/platform/query"
-	"github.com/influxdata/platform/tsdb"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
@@ -33,122 +31,6 @@ const (
 	// The extension used to describe corrupt snapshot files.
 	BadTSMFileExtension = "bad"
 )
-
-// TSMFile represents an on-disk TSM file.
-type TSMFile interface {
-	// Path returns the underlying file path for the TSMFile.  If the file
-	// has not be written or loaded from disk, the zero value is returned.
-	Path() string
-
-	// Read returns all the values in the block where time t resides.
-	Read(key []byte, t int64) ([]Value, error)
-
-	// ReadAt returns all the values in the block identified by entry.
-	ReadAt(entry *IndexEntry, values []Value) ([]Value, error)
-	ReadFloatBlockAt(entry *IndexEntry, values *[]FloatValue) ([]FloatValue, error)
-	ReadFloatArrayBlockAt(entry *IndexEntry, values *tsdb.FloatArray) error
-	ReadIntegerBlockAt(entry *IndexEntry, values *[]IntegerValue) ([]IntegerValue, error)
-	ReadIntegerArrayBlockAt(entry *IndexEntry, values *tsdb.IntegerArray) error
-	ReadUnsignedBlockAt(entry *IndexEntry, values *[]UnsignedValue) ([]UnsignedValue, error)
-	ReadUnsignedArrayBlockAt(entry *IndexEntry, values *tsdb.UnsignedArray) error
-	ReadStringBlockAt(entry *IndexEntry, values *[]StringValue) ([]StringValue, error)
-	ReadStringArrayBlockAt(entry *IndexEntry, values *tsdb.StringArray) error
-	ReadBooleanBlockAt(entry *IndexEntry, values *[]BooleanValue) ([]BooleanValue, error)
-	ReadBooleanArrayBlockAt(entry *IndexEntry, values *tsdb.BooleanArray) error
-
-	// Entries returns the index entries for all blocks for the given key.
-	Entries(key []byte) []IndexEntry
-	ReadEntries(key []byte, entries *[]IndexEntry) []IndexEntry
-
-	// Returns true if the TSMFile may contain a value with the specified
-	// key and time.
-	ContainsValue(key []byte, t int64) bool
-
-	// Contains returns true if the file contains any values for the given
-	// key.
-	Contains(key []byte) bool
-
-	// OverlapsTimeRange returns true if the time range of the file intersect min and max.
-	OverlapsTimeRange(min, max int64) bool
-
-	// OverlapsKeyRange returns true if the key range of the file intersects min and max.
-	OverlapsKeyRange(min, max []byte) bool
-
-	// TimeRange returns the min and max time across all keys in the file.
-	TimeRange() (int64, int64)
-
-	// TombstoneRange returns ranges of time that are deleted for the given key.
-	TombstoneRange(key []byte) []TimeRange
-
-	// KeyRange returns the min and max keys in the file.
-	KeyRange() ([]byte, []byte)
-
-	// KeyCount returns the number of distinct keys in the file.
-	KeyCount() int
-
-	// Seek returns the position in the index with the key <= key.
-	Seek(key []byte) int
-
-	// KeyAt returns the key located at index position idx.
-	KeyAt(idx int) ([]byte, byte)
-
-	// Type returns the block type of the values stored for the key.  Returns one of
-	// BlockFloat64, BlockInt64, BlockBoolean, BlockString.  If key does not exist,
-	// an error is returned.
-	Type(key []byte) (byte, error)
-
-	// BatchDelete return a BatchDeleter that allows for multiple deletes in batches
-	// and group commit or rollback.
-	BatchDelete() BatchDeleter
-
-	// Delete removes the keys from the set of keys available in this file.
-	Delete(keys [][]byte) error
-
-	// DeleteRange removes the values for keys between timestamps min and max.
-	DeleteRange(keys [][]byte, min, max int64) error
-
-	// HasTombstones returns true if file contains values that have been deleted.
-	HasTombstones() bool
-
-	// TombstoneFiles returns the tombstone filestats if there are any tombstones
-	// written for this file.
-	TombstoneFiles() []FileStat
-
-	// Close closes the underlying file resources.
-	Close() error
-
-	// Size returns the size of the file on disk in bytes.
-	Size() uint32
-
-	// Rename renames the existing TSM file to a new name and replaces the mmap backing slice using the new
-	// file name.  Index and Reader state are not re-initialized.
-	Rename(path string) error
-
-	// Remove deletes the file from the filesystem.
-	Remove() error
-
-	// InUse returns true if the file is currently in use by queries.
-	InUse() bool
-
-	// Ref records that this file is actively in use.
-	Ref()
-
-	// Unref records that this file is no longer in use.
-	Unref()
-
-	// Stats returns summary information about the TSM file.
-	Stats() FileStat
-
-	// BlockIterator returns an iterator pointing to the first block in the file and
-	// allows sequential iteration to each and every block.
-	BlockIterator() *BlockIterator
-
-	// Free releases any resources held by the FileStore to free up system resources.
-	Free() error
-
-	// Stats returns the statistics for the file.
-	MeasurementStats() (MeasurementStats, error)
-}
 
 // FileStoreObserver is passed notifications before the file store adds or deletes files. In this way, it can
 // be sure to observe every file that is added or removed even in the presence of process death.
@@ -184,7 +66,7 @@ type FileStore struct {
 	currentGeneration int
 	dir               string
 
-	files           []TSMFile
+	files           []*TSMReader
 	tsmMMAPWillNeed bool          // If true then the kernel will be advised MMAP_WILLNEED for TSM files.
 	openLimiter     limiter.Fixed // limit the number of concurrent opening TSM files.
 
@@ -237,7 +119,7 @@ func NewFileStore(dir string) *FileStore {
 		traceLogger:  logger,
 		openLimiter:  limiter.NewFixed(runtime.GOMAXPROCS(0)),
 		purger: &purger{
-			files:  map[string]TSMFile{},
+			files:  map[string]*TSMReader{},
 			logger: logger,
 		},
 		obs:           noFileStoreObserver{},
@@ -347,7 +229,7 @@ func (f *FileStore) Count() int {
 
 // Files returns the slice of TSM files currently loaded. This is only used for
 // tests, and the files aren't guaranteed to stay valid in the presense of compactions.
-func (f *FileStore) Files() []TSMFile {
+func (f *FileStore) Files() []*TSMReader {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	return f.files
@@ -381,46 +263,18 @@ func (f *FileStore) NextGeneration() int {
 	return f.currentGeneration
 }
 
-// WalkKeys calls fn for every key in every TSM file known to the FileStore.  If the key
-// exists in multiple files, it will be invoked for each file.
-func (f *FileStore) WalkKeys(seek []byte, fn func(key []byte, typ byte) error) error {
-	f.mu.RLock()
-	if len(f.files) == 0 {
-		f.mu.RUnlock()
-		return nil
-	}
-
-	// Ensure files are not unmapped while we're iterating over them.
-	for _, r := range f.files {
-		r.Ref()
-		defer r.Unref()
-	}
-
-	ki := newMergeKeyIterator(f.files, seek)
-	f.mu.RUnlock()
-	for ki.Next() {
-		key, typ := ki.Read()
-		if err := fn(key, typ); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // Keys returns all keys and types for all files in the file store.
 func (f *FileStore) Keys() map[string]byte {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
 	uniqueKeys := map[string]byte{}
-	if err := f.WalkKeys(nil, func(key []byte, typ byte) error {
-		uniqueKeys[string(key)] = typ
-		return nil
-	}); err != nil {
-		return nil
+	for _, f := range f.files {
+		for i := 0; i < f.KeyCount(); i++ {
+			k, typ := f.KeyAt(i)
+			uniqueKeys[string(k)] = typ
+		}
 	}
-
 	return uniqueKeys
 }
 
@@ -442,7 +296,7 @@ func (f *FileStore) Delete(keys [][]byte) error {
 	return f.DeleteRange(keys, math.MinInt64, math.MaxInt64)
 }
 
-func (f *FileStore) Apply(fn func(r TSMFile) error) error {
+func (f *FileStore) Apply(fn func(r *TSMReader) error) error {
 	// Limit apply fn to number of cores
 	limiter := limiter.NewFixed(runtime.GOMAXPROCS(0))
 
@@ -450,7 +304,7 @@ func (f *FileStore) Apply(fn func(r TSMFile) error) error {
 	errC := make(chan error, len(f.files))
 
 	for _, f := range f.files {
-		go func(r TSMFile) {
+		go func(r *TSMReader) {
 			limiter.Take()
 			defer limiter.Release()
 
@@ -685,12 +539,6 @@ func (f *FileStore) Read(key []byte, t int64) ([]Value, error) {
 	return nil, nil
 }
 
-func (f *FileStore) Cost(key []byte, min, max int64) query.IteratorCost {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.cost(key, min, max)
-}
-
 // Reader returns a TSMReader for path if one is currently managed by the FileStore.
 // Otherwise it returns nil. If it returns a file, you must call Unref on it when
 // you are done, and never use it after that.
@@ -700,7 +548,7 @@ func (f *FileStore) TSMReader(path string) *TSMReader {
 	for _, r := range f.files {
 		if r.Path() == path {
 			r.Ref()
-			return r.(*TSMReader)
+			return r
 		}
 	}
 	return nil
@@ -744,7 +592,7 @@ func (f *FileStore) Stats() []FileStat {
 }
 
 // ReplaceWithCallback replaces oldFiles with newFiles and calls updatedFn with the files to be added the FileStore.
-func (f *FileStore) ReplaceWithCallback(oldFiles, newFiles []string, updatedFn func(r []TSMFile)) error {
+func (f *FileStore) ReplaceWithCallback(oldFiles, newFiles []string, updatedFn func(r []*TSMReader)) error {
 	return f.replace(oldFiles, newFiles, updatedFn)
 }
 
@@ -753,7 +601,7 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 	return f.replace(oldFiles, newFiles, nil)
 }
 
-func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMFile)) error {
+func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []*TSMReader)) error {
 	if len(oldFiles) == 0 && len(newFiles) == 0 {
 		return nil
 	}
@@ -762,7 +610,7 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 	maxTime := f.lastModified
 	f.mu.RUnlock()
 
-	updated := make([]TSMFile, 0, len(newFiles))
+	updated := make([]*TSMReader, 0, len(newFiles))
 	tsmTmpExt := fmt.Sprintf("%s.%s", TSMFileExtension, TmpTSMFileExtension)
 
 	// Rename all the new files to make them live on restart
@@ -830,7 +678,7 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 	updated = append(updated, f.files...)
 
 	// We need to prune our set of active files now
-	var active, inuse []TSMFile
+	var active, inuse []*TSMReader
 	for _, file := range updated {
 		keep := true
 		for _, remove := range oldFiles {
@@ -978,52 +826,11 @@ func (f *FileStore) BlockCount(path string, idx int) int {
 	return 0
 }
 
-// We need to determine the possible files that may be accessed by this query given
-// the time range.
-func (f *FileStore) cost(key []byte, min, max int64) query.IteratorCost {
-	var cache []IndexEntry
-	cost := query.IteratorCost{}
-	for _, fd := range f.files {
-		minTime, maxTime := fd.TimeRange()
-		if !(maxTime > min && minTime < max) {
-			continue
-		}
-		skipped := true
-		tombstones := fd.TombstoneRange(key)
-
-		entries := fd.ReadEntries(key, &cache)
-	ENTRIES:
-		for i := 0; i < len(entries); i++ {
-			ie := entries[i]
-
-			if !(ie.MaxTime > min && ie.MinTime < max) {
-				continue
-			}
-
-			// Skip any blocks only contain values that are tombstoned.
-			for _, t := range tombstones {
-				if t.Min <= ie.MinTime && t.Max >= ie.MaxTime {
-					continue ENTRIES
-				}
-			}
-
-			cost.BlocksRead++
-			cost.BlockSize += int64(ie.Size)
-			skipped = false
-		}
-
-		if !skipped {
-			cost.NumFiles++
-		}
-	}
-	return cost
-}
-
 // locations returns the files and index blocks for a key and time.  ascending indicates
 // whether the key will be scan in ascending time order or descenging time order.
 // This function assumes the read-lock has been taken.
 func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
-	var cache []IndexEntry
+	var entries []IndexEntry
 	locations := make([]*location, 0, len(f.files))
 	for _, fd := range f.files {
 		minTime, maxTime := fd.TimeRange()
@@ -1041,7 +848,7 @@ func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
 
 		// This file could potential contain points we are looking for so find the blocks for
 		// the given key.
-		entries := fd.ReadEntries(key, &cache)
+		entries = fd.ReadEntries(key, entries)
 	LOOP:
 		for i := 0; i < len(entries); i++ {
 			ie := entries[i]
@@ -1094,7 +901,7 @@ func (f *FileStore) CreateSnapshot() (string, error) {
 	f.mu.Lock()
 	// create a copy of the files slice and ensure they aren't closed out from
 	// under us, nor the slice mutated.
-	files := make([]TSMFile, len(f.files))
+	files := make([]*TSMReader, len(f.files))
 	copy(files, f.files)
 
 	for _, tsmf := range files {
@@ -1210,7 +1017,7 @@ type KeyCursor struct {
 }
 
 type location struct {
-	r     TSMFile
+	r     *TSMReader
 	entry IndexEntry
 
 	readMin, readMax int64
@@ -1408,13 +1215,13 @@ func (c *KeyCursor) nextDescending() {
 type purger struct {
 	mu        sync.RWMutex
 	fileStore *FileStore
-	files     map[string]TSMFile
+	files     map[string]*TSMReader
 	running   bool
 
 	logger *zap.Logger
 }
 
-func (p *purger) add(files []TSMFile) {
+func (p *purger) add(files []*TSMReader) {
 	p.mu.Lock()
 	for _, f := range files {
 		p.files[f.Path()] = f
@@ -1467,7 +1274,7 @@ func (p *purger) purge() {
 	}()
 }
 
-type tsmReaders []TSMFile
+type tsmReaders []*TSMReader
 
 func (a tsmReaders) Len() int           { return len(a) }
 func (a tsmReaders) Less(i, j int) bool { return a[i].Path() < a[j].Path() }

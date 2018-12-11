@@ -48,7 +48,7 @@ var strSliceRes [][]byte
 func benchmarkRingkeys(b *testing.B, r *ring, keys int) {
 	// Add some keys
 	for i := 0; i < keys; i++ {
-		r.add([]byte(fmt.Sprintf("cpu,host=server-%d value=1", i)), nil)
+		r.add([]byte(fmt.Sprintf("cpu,host=server-%d value=1", i)), new(entry))
 	}
 
 	b.ReportAllocs()
@@ -58,10 +58,10 @@ func benchmarkRingkeys(b *testing.B, r *ring, keys int) {
 	}
 }
 
-func BenchmarkRing_keys_100(b *testing.B)    { benchmarkRingkeys(b, MustNewRing(256), 100) }
-func BenchmarkRing_keys_1000(b *testing.B)   { benchmarkRingkeys(b, MustNewRing(256), 1000) }
-func BenchmarkRing_keys_10000(b *testing.B)  { benchmarkRingkeys(b, MustNewRing(256), 10000) }
-func BenchmarkRing_keys_100000(b *testing.B) { benchmarkRingkeys(b, MustNewRing(256), 100000) }
+func BenchmarkRing_keys_100(b *testing.B)    { benchmarkRingkeys(b, MustNewRing(), 100) }
+func BenchmarkRing_keys_1000(b *testing.B)   { benchmarkRingkeys(b, MustNewRing(), 1000) }
+func BenchmarkRing_keys_10000(b *testing.B)  { benchmarkRingkeys(b, MustNewRing(), 10000) }
+func BenchmarkRing_keys_100000(b *testing.B) { benchmarkRingkeys(b, MustNewRing(), 100000) }
 
 func benchmarkRingGetPartition(b *testing.B, r *ring, keys int) {
 	vals := make([][]byte, keys)
@@ -69,7 +69,7 @@ func benchmarkRingGetPartition(b *testing.B, r *ring, keys int) {
 	// Add some keys
 	for i := 0; i < keys; i++ {
 		vals[i] = []byte(fmt.Sprintf("cpu,host=server-%d field1=value1,field2=value2,field4=value4,field5=value5,field6=value6,field7=value7,field8=value1,field9=value2,field10=value4,field11=value5,field12=value6,field13=value7", i))
-		r.add(vals[i], nil)
+		r.add(vals[i], new(entry))
 	}
 
 	b.ReportAllocs()
@@ -79,9 +79,9 @@ func benchmarkRingGetPartition(b *testing.B, r *ring, keys int) {
 	}
 }
 
-func BenchmarkRing_getPartition_100(b *testing.B) { benchmarkRingGetPartition(b, MustNewRing(256), 100) }
+func BenchmarkRing_getPartition_100(b *testing.B) { benchmarkRingGetPartition(b, MustNewRing(), 100) }
 func BenchmarkRing_getPartition_1000(b *testing.B) {
-	benchmarkRingGetPartition(b, MustNewRing(256), 1000)
+	benchmarkRingGetPartition(b, MustNewRing(), 1000)
 }
 
 func benchmarkRingWrite(b *testing.B, r *ring, n int) {
@@ -114,29 +114,13 @@ func benchmarkRingWrite(b *testing.B, r *ring, n int) {
 	}
 }
 
-func BenchmarkRing_write_1_100(b *testing.B)      { benchmarkRingWrite(b, MustNewRing(1), 100) }
-func BenchmarkRing_write_1_1000(b *testing.B)     { benchmarkRingWrite(b, MustNewRing(1), 1000) }
-func BenchmarkRing_write_1_10000(b *testing.B)    { benchmarkRingWrite(b, MustNewRing(1), 10000) }
-func BenchmarkRing_write_1_100000(b *testing.B)   { benchmarkRingWrite(b, MustNewRing(1), 100000) }
-func BenchmarkRing_write_4_100(b *testing.B)      { benchmarkRingWrite(b, MustNewRing(4), 100) }
-func BenchmarkRing_write_4_1000(b *testing.B)     { benchmarkRingWrite(b, MustNewRing(4), 1000) }
-func BenchmarkRing_write_4_10000(b *testing.B)    { benchmarkRingWrite(b, MustNewRing(4), 10000) }
-func BenchmarkRing_write_4_100000(b *testing.B)   { benchmarkRingWrite(b, MustNewRing(4), 100000) }
-func BenchmarkRing_write_32_100(b *testing.B)     { benchmarkRingWrite(b, MustNewRing(32), 100) }
-func BenchmarkRing_write_32_1000(b *testing.B)    { benchmarkRingWrite(b, MustNewRing(32), 1000) }
-func BenchmarkRing_write_32_10000(b *testing.B)   { benchmarkRingWrite(b, MustNewRing(32), 10000) }
-func BenchmarkRing_write_32_100000(b *testing.B)  { benchmarkRingWrite(b, MustNewRing(32), 100000) }
-func BenchmarkRing_write_128_100(b *testing.B)    { benchmarkRingWrite(b, MustNewRing(128), 100) }
-func BenchmarkRing_write_128_1000(b *testing.B)   { benchmarkRingWrite(b, MustNewRing(128), 1000) }
-func BenchmarkRing_write_128_10000(b *testing.B)  { benchmarkRingWrite(b, MustNewRing(128), 10000) }
-func BenchmarkRing_write_128_100000(b *testing.B) { benchmarkRingWrite(b, MustNewRing(256), 100000) }
-func BenchmarkRing_write_256_100(b *testing.B)    { benchmarkRingWrite(b, MustNewRing(256), 100) }
-func BenchmarkRing_write_256_1000(b *testing.B)   { benchmarkRingWrite(b, MustNewRing(256), 1000) }
-func BenchmarkRing_write_256_10000(b *testing.B)  { benchmarkRingWrite(b, MustNewRing(256), 10000) }
-func BenchmarkRing_write_256_100000(b *testing.B) { benchmarkRingWrite(b, MustNewRing(256), 100000) }
+func BenchmarkRing_write_100(b *testing.B)    { benchmarkRingWrite(b, MustNewRing(), 100) }
+func BenchmarkRing_write_1000(b *testing.B)   { benchmarkRingWrite(b, MustNewRing(), 1000) }
+func BenchmarkRing_write_10000(b *testing.B)  { benchmarkRingWrite(b, MustNewRing(), 10000) }
+func BenchmarkRing_write_100000(b *testing.B) { benchmarkRingWrite(b, MustNewRing(), 100000) }
 
-func MustNewRing(n int) *ring {
-	r, err := newring(n)
+func MustNewRing() *ring {
+	r, err := newring(partitions)
 	if err != nil {
 		panic(err)
 	}
