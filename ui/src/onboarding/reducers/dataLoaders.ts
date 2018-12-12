@@ -5,7 +5,10 @@ import _ from 'lodash'
 import {
   createNewPlugin,
   updateConfigFields,
+  getConfigFields,
 } from 'src/onboarding/utils/pluginConfigs'
+import {getDeep} from 'src/utils/wrappers'
+import {validateURI} from 'src/shared/utils/validateURI'
 
 // Types
 import {Action} from 'src/onboarding/actions/dataLoaders'
@@ -13,6 +16,9 @@ import {
   DataLoaderType,
   LineProtocolTab,
   DataLoadersState,
+  ConfigurationState,
+  ConfigFieldType,
+  Plugin,
 } from 'src/types/v2/dataLoaders'
 import {RemoteDataState} from 'src/types'
 import {WritePrecision} from 'src/api'
@@ -150,13 +156,54 @@ export default (state = INITIAL_STATE, action: Action): DataLoadersState => {
         }),
       }
     case 'SET_PLUGIN_CONFIGURATION_STATE':
-      const configured = action.payload.configured
+      // TODO: move logic to check if action.payload.plugin is configured correctly here
+      // same w/ setStepStatus
+
+      // go through every telegraf plugin
+      // find the config fields for each telegraf plugin
+      // if it has no fields, then it's configured
+      // otherwise, if it has fields, then check the fields
+
       return {
         ...state,
         telegrafPlugins: state.telegrafPlugins.map(tp => {
-          if (tp.name === action.payload.telegrafPlugin) {
-            return {...tp, configured}
+          const name = _.get(tp, 'name')
+          const configFields = getConfigFields(name)
+          if (!configFields) {
+            return {...tp, configured: ConfigurationState.Configured}
           }
+
+          const plugin = getDeep<Plugin>(tp, 'plugin', createNewPlugin(name))
+          const {config} = plugin
+          let isValidConfig = true
+
+          Object.entries(configFields).forEach(configField => {
+            const [fieldName, fieldType] = configField
+            const fieldValue = config[fieldName]
+
+            const isValidUri =
+              fieldType === ConfigFieldType.Uri &&
+              validateURI(fieldValue as string)
+            const isValidString =
+              fieldType === ConfigFieldType.String &&
+              (fieldValue as string) !== ''
+            const isValidArray =
+              (fieldType === ConfigFieldType.StringArray ||
+                fieldType === ConfigFieldType.UriArray) &&
+              (fieldValue as string[]).length
+
+            console.log('tp valid Uri: ', tp.name, isValidUri)
+            if (!isValidUri && !isValidString && !isValidArray) {
+              isValidConfig = false
+            }
+
+            if (!isValidConfig || _.isEmpty(config)) {
+              return {...tp, configured: ConfigurationState.Unconfigured}
+            } else {
+              return {...tp, configured: ConfigurationState.Configured}
+            }
+          })
+
           return {...tp}
         }),
       }

@@ -15,6 +15,7 @@ import {
   LineProtocolTab,
   Plugin,
   ConfigurationState,
+  TelegrafPluginName,
 } from 'src/types/v2/dataLoaders'
 import {AppState} from 'src/types/v2'
 import {RemoteDataState} from 'src/types'
@@ -39,7 +40,7 @@ export type Action =
   | SetLPStatus
   | SetPrecision
   | UpdateTelegrafPlugin
-  | SetPluginConfigurationState
+  | SetPluginConfiguration
 
 interface SetDataLoadersType {
   type: 'SET_DATA_LOADERS_TYPE'
@@ -196,20 +197,12 @@ export const setActiveTelegrafPlugin = (
   payload: {telegrafPlugin},
 })
 
-interface SetPluginConfigurationState {
+interface SetPluginConfiguration {
   type: 'SET_PLUGIN_CONFIGURATION_STATE'
-  payload: {
-    telegrafPlugin: string
-    configured: ConfigurationState
-  }
 }
 
-export const setPluginConfigurationState = (
-  telegrafPlugin: string,
-  configured: ConfigurationState
-): SetPluginConfigurationState => ({
+export const setPluginConfiguration = (): SetPluginConfiguration => ({
   type: 'SET_PLUGIN_CONFIGURATION_STATE',
-  payload: {telegrafPlugin, configured},
 })
 
 interface SetLineProtocolBody {
