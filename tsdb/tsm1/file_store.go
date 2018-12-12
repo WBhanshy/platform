@@ -270,9 +270,9 @@ func (f *FileStore) Keys() map[string]byte {
 
 	uniqueKeys := map[string]byte{}
 	for _, f := range f.files {
-		for i := 0; i < f.KeyCount(); i++ {
-			k, typ := f.KeyAt(i)
-			uniqueKeys[string(k)] = typ
+		iter := f.Iterator([]byte{})
+		for iter.Next() {
+			uniqueKeys[string(iter.Key())] = iter.Type()
 		}
 	}
 	return uniqueKeys
@@ -831,6 +831,8 @@ func (f *FileStore) BlockCount(path string, idx int) int {
 // This function assumes the read-lock has been taken.
 func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
 	var entries []IndexEntry
+	var err error
+
 	locations := make([]*location, 0, len(f.files))
 	for _, fd := range f.files {
 		minTime, maxTime := fd.TimeRange()
@@ -848,7 +850,12 @@ func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
 
 		// This file could potential contain points we are looking for so find the blocks for
 		// the given key.
-		entries = fd.ReadEntries(key, entries)
+		entries, err = fd.ReadEntries(key, entries)
+		if err != nil {
+			// TODO(jeff): is this the right thing? it feels like we should report corruption
+			// all the way up somehow.
+			continue
+		}
 	LOOP:
 		for i := 0; i < len(entries); i++ {
 			ie := entries[i]

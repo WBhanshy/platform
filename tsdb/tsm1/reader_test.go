@@ -1089,7 +1089,10 @@ func TestIndirectIndex_Entries(t *testing.T) {
 		t.Fatalf("unexpected error unmarshaling index: %v", err)
 	}
 
-	entries := indirect.Entries([]byte("cpu"))
+	entries, err := indirect.Entries([]byte("cpu"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got, exp := len(entries), len(exp); got != exp {
 		t.Fatalf("entries length mismatch: got %v, exp %v", got, exp)
@@ -1132,7 +1135,10 @@ func TestIndirectIndex_Entries_NonExistent(t *testing.T) {
 	// mem has not been added to the index so we should get no entries back
 	// for both
 	exp := index.Entries([]byte("mem"))
-	entries := indirect.Entries([]byte("mem"))
+	entries, err := indirect.Entries([]byte("mem"))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if got, exp := len(entries), len(exp); got != exp && exp != 0 {
 		t.Fatalf("entries length mismatch: got %v, exp %v", got, exp)
@@ -1924,7 +1930,7 @@ func BenchmarkIndirectIndex_ReadEntries(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		cache = indirect.ReadEntries([]byte("cpu-00000001"), cache)
+		cache, _ = indirect.ReadEntries([]byte("cpu-00000001"), cache)
 	}
 }
 

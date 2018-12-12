@@ -8,21 +8,17 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 
 	"github.com/influxdata/platform/pkg/bytesutil"
 	"github.com/influxdata/platform/pkg/file"
+	"github.com/influxdata/platform/tsdb/tsm1/bptree"
 )
 
 // ErrFileInUse is returned when attempting to remove or close a TSM file that is still being used.
 var ErrFileInUse = fmt.Errorf("file still in use")
-
-// nilOffset is the value written to the offsets to indicate that position is deleted.  The value is the max
-// uint32 which is an invalid position.  We don't use 0 as 0 is actually a valid position.
-var nilOffset = []byte{255, 255, 255, 255}
 
 // TSMReader is a reader for a TSM file.
 type TSMReader struct {
@@ -50,88 +46,6 @@ type TSMReader struct {
 
 	// deleteMu limits concurrent deletes
 	deleteMu sync.Mutex
-}
-
-// BlockIterator allows iterating over each block in a TSM file in order.  It provides
-// raw access to the block bytes without decoding them.
-type BlockIterator struct {
-	r *TSMReader
-
-	// i is the current key index
-	i int
-
-	// n is the total number of keys
-	n int
-
-	key     []byte
-	cache   []IndexEntry
-	entries []IndexEntry
-	err     error
-	typ     byte
-}
-
-// PeekNext returns the next key to be iterated or an empty string.
-func (b *BlockIterator) PeekNext() []byte {
-	if len(b.entries) > 1 {
-		return b.key
-	} else if b.n-b.i > 1 {
-		key, _ := b.r.KeyAt(b.i + 1)
-		return key
-	}
-	return nil
-}
-
-// Next returns true if there are more blocks to iterate through.
-func (b *BlockIterator) Next() bool {
-	if b.err != nil {
-		return false
-	}
-
-	if b.n-b.i == 0 && len(b.entries) == 0 {
-		return false
-	}
-
-	if len(b.entries) > 0 {
-		b.entries = b.entries[1:]
-		if len(b.entries) > 0 {
-			return true
-		}
-	}
-
-	if b.n-b.i > 0 {
-		b.key, b.typ, b.entries = b.r.Key(b.i, &b.cache)
-		b.i++
-
-		// If there were deletes on the TSMReader, then our index is now off and we
-		// can't proceed.  What we just read may not actually the next block.
-		if b.n != b.r.KeyCount() {
-			b.err = fmt.Errorf("delete during iteration")
-			return false
-		}
-
-		if len(b.entries) > 0 {
-			return true
-		}
-	}
-
-	return false
-}
-
-// Read reads information about the next block to be iterated.
-func (b *BlockIterator) Read() (key []byte, minTime int64, maxTime int64, typ byte, checksum uint32, buf []byte, err error) {
-	if b.err != nil {
-		return nil, 0, 0, 0, 0, nil, b.err
-	}
-	checksum, buf, err = b.r.ReadBytes(&b.entries[0], nil)
-	if err != nil {
-		return nil, 0, 0, 0, 0, nil, err
-	}
-	return b.key, b.entries[0].MinTime, b.entries[0].MaxTime, b.typ, checksum, buf, err
-}
-
-// Err returns any errors encounter during iteration.
-func (b *BlockIterator) Err() error {
-	return b.err
 }
 
 type tsmReaderOption func(*TSMReader)
@@ -192,6 +106,9 @@ func (t *TSMReader) applyTombstones() error {
 		cur = ts
 		if len(batch) > 0 {
 			if prev.Min != cur.Min || prev.Max != cur.Max {
+				if !bytesutil.IsSorted(batch) {
+					bytesutil.Sort(batch)
+				}
 				t.index.DeleteRange(batch, prev.Min, prev.Max)
 				batch = batch[:0]
 			}
@@ -208,6 +125,9 @@ func (t *TSMReader) applyTombstones() error {
 		copy(batch[n], ts.Key)
 
 		if len(batch) >= 4096 {
+			if !bytesutil.IsSorted(batch) {
+				bytesutil.Sort(batch)
+			}
 			t.index.DeleteRange(batch, prev.Min, prev.Max)
 			batch = batch[:0]
 		}
@@ -219,6 +139,9 @@ func (t *TSMReader) applyTombstones() error {
 	}
 
 	if len(batch) > 0 {
+		if !bytesutil.IsSorted(batch) {
+			bytesutil.Sort(batch)
+		}
 		t.index.DeleteRange(batch, cur.Min, cur.Max)
 	}
 	return nil
@@ -236,20 +159,6 @@ func (t *TSMReader) Path() string {
 	p := t.accessor.path()
 	t.mu.RUnlock()
 	return p
-}
-
-// Key returns the key and the underlying entry at the numeric index.
-func (t *TSMReader) Key(index int, entries *[]IndexEntry) ([]byte, byte, []IndexEntry) {
-	return t.index.Key(index, entries)
-}
-
-// KeyAt returns the key and key type at position idx in the index.
-func (t *TSMReader) KeyAt(idx int) ([]byte, byte) {
-	return t.index.KeyAt(idx)
-}
-
-func (t *TSMReader) Seek(key []byte) int {
-	return t.index.Seek(key)
 }
 
 // ReadAt returns the values corresponding to the given index entry.
@@ -418,6 +327,12 @@ func (t *TSMReader) Delete(keys [][]byte) error {
 	return nil
 }
 
+// Iterator returns an iterator over the keys starting at the provided key. You must
+// call Next before calling any of the accessors.
+func (t *TSMReader) Iterator(key []byte) *TSMIndexIterator {
+	return t.index.Iterator(key)
+}
+
 // OverlapsTimeRange returns true if the time range of the file intersect min and max.
 func (t *TSMReader) OverlapsTimeRange(min, max int64) bool {
 	return t.index.OverlapsTimeRange(min, max)
@@ -444,12 +359,12 @@ func (t *TSMReader) KeyCount() int {
 }
 
 // Entries returns all index entries for key.
-func (t *TSMReader) Entries(key []byte) []IndexEntry {
+func (t *TSMReader) Entries(key []byte) ([]IndexEntry, error) {
 	return t.index.Entries(key)
 }
 
 // ReadEntries reads the index entries for key into entries.
-func (t *TSMReader) ReadEntries(key []byte, entries []IndexEntry) []IndexEntry {
+func (t *TSMReader) ReadEntries(key []byte, entries []IndexEntry) ([]IndexEntry, error) {
 	return t.index.ReadEntries(key, entries)
 }
 
@@ -521,9 +436,13 @@ func (t *TSMReader) Stats() FileStat {
 
 // BlockIterator returns a BlockIterator for the underlying TSM file.
 func (t *TSMReader) BlockIterator() *BlockIterator {
+	t.mu.RLock()
+	iter := t.index.Iterator([]byte{})
+	t.mu.RUnlock()
+
 	return &BlockIterator{
-		r: t,
-		n: t.index.KeyCount(),
+		r:    t,
+		iter: iter,
 	}
 }
 
@@ -639,30 +558,14 @@ type indirectIndex struct {
 	// indirectIndex works a follows.  Assuming we have an index structure in memory as
 	// the diagram below:
 	//
-	// ┌────────────────────────────────────────────────────────────────────┐
-	// │                               Index                                │
-	// ├─┬──────────────────────┬──┬───────────────────────┬───┬────────────┘
-	// │0│                      │62│                       │145│
-	// ├─┴───────┬─────────┬────┼──┴──────┬─────────┬──────┼───┴─────┬──────┐
+	// ┌─-───────┬─────────┬────┬──-──────┬─────────┬──────┬───-─────┬──────┐
 	// │Key 1 Len│   Key   │... │Key 2 Len│  Key 2  │ ...  │  Key 3  │ ...  │
 	// │ 2 bytes │ N bytes │    │ 2 bytes │ N bytes │      │ 2 bytes │      │
 	// └─────────┴─────────┴────┴─────────┴─────────┴──────┴─────────┴──────┘
 
-	// We would build an `offsets` slices where each element pointers to the byte location
-	// for the first key in the index slice.
-
-	// ┌────────────────────────────────────────────────────────────────────┐
-	// │                              Offsets                               │
-	// ├────┬────┬────┬─────────────────────────────────────────────────────┘
-	// │ 0  │ 62 │145 │
-	// └────┴────┴────┘
-
-	// Using this offset slice we can find `Key 2` by doing a binary search
-	// over the offsets slice.  Instead of comparing the value in the offsets
-	// (e.g. `62`), we use that as an index into the underlying index to
-	// retrieve the key at postion `62` and perform our comparisons with that.
-
-	// When we have identified the correct position in the index for a given
+	// We then build a b+tree of the keys (which can be done efficiently because we know
+	// the keys are in order) mapping to their first entry in the index.
+	// When we have identified the first enty in the index for a given
 	// key, we could perform another binary search or a linear scan.  This
 	// should be fast as well since each index entry is 28 bytes and all
 	// contiguous in memory.  The current implementation uses a linear scan since the
@@ -672,9 +575,8 @@ type indirectIndex struct {
 	// slice reference
 	b []byte
 
-	// offsets contains the positions in b for each key.  It points to the 2 byte length of
-	// key.
-	offsets []byte
+	// tree contains a b+tree of keys to their starting offsets in the index.
+	tree *bptree.T
 
 	// minKey, maxKey are the minium and maximum (lexicographically sorted) contained in the
 	// file
@@ -686,8 +588,9 @@ type indirectIndex struct {
 
 	// tombstones contains only the tombstoned keys with subset of time values deleted.  An
 	// entry would exist here if a subset of the points for a key were deleted and the file
-	// had not be re-compacted to remove the points on disk.
-	tombstones map[string][]TimeRange
+	// had not be re-compacted to remove the points on disk. It uses the offset of the key to
+	// identify it.
+	tombstones map[uint32][]TimeRange
 }
 
 // TimeRange holds a min and max timestamp.
@@ -702,88 +605,25 @@ func (t TimeRange) Overlaps(min, max int64) bool {
 // NewIndirectIndex returns a new indirect index.
 func NewIndirectIndex() *indirectIndex {
 	return &indirectIndex{
-		tombstones: make(map[string][]TimeRange),
+		tombstones: make(map[uint32][]TimeRange),
 	}
 }
 
-func (d *indirectIndex) offset(i int) int {
-	if i < 0 || i+4 > len(d.offsets) {
-		return -1
-	}
-	return int(binary.BigEndian.Uint32(d.offsets[i*4 : i*4+4]))
-}
-
-func (d *indirectIndex) Seek(key []byte) int {
+// treeEntry reports the b+tree entry for the key and a boolean if it existed.
+func (d *indirectIndex) treeEntry(key []byte) (*bptree.Entry, bool) {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.searchOffset(key)
+	ent, exact := d.treeEntryLocked(key)
+	d.mu.RUnlock()
+	return ent, exact
 }
 
-// searchOffset searches the offsets slice for key and returns the position in
-// offsets where key would exist.
-func (d *indirectIndex) searchOffset(key []byte) int {
-	// We use a binary search across our indirect offsets (pointers to all the keys
-	// in the index slice).
-	i := bytesutil.SearchBytesFixed(d.offsets, 4, func(x []byte) bool {
-		// i is the position in offsets we are at so get offset it points to
-		offset := int32(binary.BigEndian.Uint32(x))
-
-		// It's pointing to the start of the key which is a 2 byte length
-		keyLen := int32(binary.BigEndian.Uint16(d.b[offset : offset+2]))
-
-		// See if it matches
-		return bytes.Compare(d.b[offset+2:offset+2+keyLen], key) >= 0
-	})
-
-	// See if we might have found the right index
-	if i < len(d.offsets) {
-		return int(i / 4)
-	}
-
-	// The key is not in the index.  i is the index where it would be inserted so return
-	// a value outside our offset range.
-	return int(len(d.offsets)) / 4
-}
-
-// search returns the byte position of key in the index.  If key is not
-// in the index, len(index) is returned.
-func (d *indirectIndex) search(key []byte) int {
-	if !d.ContainsKey(key) {
-		return len(d.b)
-	}
-
-	// We use a binary search across our indirect offsets (pointers to all the keys
-	// in the index slice).
-	// TODO(sgc): this should be inlined to `indirectIndex` as it is only used here
-	i := bytesutil.SearchBytesFixed(d.offsets, 4, func(x []byte) bool {
-		// i is the position in offsets we are at so get offset it points to
-		offset := int32(binary.BigEndian.Uint32(x))
-
-		// It's pointing to the start of the key which is a 2 byte length
-		keyLen := int32(binary.BigEndian.Uint16(d.b[offset : offset+2]))
-
-		// See if it matches
-		return bytes.Compare(d.b[offset+2:offset+2+keyLen], key) >= 0
-	})
-
-	// See if we might have found the right index
-	if i < len(d.offsets) {
-		ofs := binary.BigEndian.Uint32(d.offsets[i : i+4])
-		_, k := readKey(d.b[ofs:])
-
-		// The search may have returned an i == 0 which could indicated that the value
-		// searched should be inserted at postion 0.  Make sure the key in the index
-		// matches the search value.
-		if !bytes.Equal(key, k) {
-			return len(d.b)
-		}
-
-		return int(ofs)
-	}
-
-	// The key is not in the index.  i is the index where it would be inserted so return
-	// a value outside our offset range.
-	return len(d.b)
+// treeEntryLocked reports the b+tree entry for the key and a boolean if it existed.
+// It must be called with the mutex.
+func (d *indirectIndex) treeEntryLocked(key []byte) (*bptree.Entry, bool) {
+	iter := d.tree.Iterator()
+	exact, _ := iter.Seek(key, d.b)
+	ent := iter.Entry()
+	return ent, exact
 }
 
 // ContainsKey returns true of key may exist in this index.
@@ -792,107 +632,66 @@ func (d *indirectIndex) ContainsKey(key []byte) bool {
 }
 
 // Entries returns all index entries for a key.
-func (d *indirectIndex) Entries(key []byte) []IndexEntry {
+func (d *indirectIndex) Entries(key []byte) ([]IndexEntry, error) {
 	return d.ReadEntries(key, nil)
 }
 
-func (d *indirectIndex) readEntriesAt(ofs int, entries []IndexEntry) ([]byte, []IndexEntry) {
-	n, k := readKey(d.b[ofs:])
-
-	// Read and return all the entries
-	ofs += n
-	var ie indexEntries
-	ie.entries = entries
-	if _, err := readEntries(d.b[ofs:], &ie); err != nil {
-		panic(fmt.Sprintf("error reading entries: %v", err))
-	}
-	return k, ie.entries
-}
-
 // ReadEntries returns all index entries for a key.
-func (d *indirectIndex) ReadEntries(key []byte, entries []IndexEntry) []IndexEntry {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	ofs := d.search(key)
-	if ofs < len(d.b) {
-		k, entries := d.readEntriesAt(ofs, entries)
-		// The search may have returned an i == 0 which could indicated that the value
-		// searched should be inserted at position 0.  Make sure the key in the index
-		// matches the search value.
-		if !bytes.Equal(key, k) {
-			return nil
-		}
-
-		return entries
+func (d *indirectIndex) ReadEntries(key []byte, entries []IndexEntry) ([]IndexEntry, error) {
+	if !d.ContainsKey(key) {
+		return nil, nil
 	}
 
-	// The key is not in the index.  i is the index where it would be inserted.
-	return nil
+	ent, ok := d.treeEntry(key)
+	if !ok {
+		return nil, nil
+	}
+
+	return readEntries(d.b[ent.EntryOffset(d.b):], entries)
 }
 
 // Entry returns the index entry for the specified key and timestamp.  If no entry
 // matches the key an timestamp, nil is returned.
-func (d *indirectIndex) Entry(key []byte, timestamp int64) *IndexEntry {
-	entries := d.Entries(key)
+func (d *indirectIndex) Entry(key []byte, timestamp int64) (*IndexEntry, error) {
+	entries, err := d.Entries(key)
+	if err != nil {
+		return nil, err
+	}
 	for _, entry := range entries {
 		if entry.Contains(timestamp) {
-			return &entry
+			return &entry, nil
 		}
 	}
-	return nil
-}
-
-// Key returns the key in the index at the given position.
-func (d *indirectIndex) Key(idx int, entries *[]IndexEntry) ([]byte, byte, []IndexEntry) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	if idx < 0 || idx*4+4 > len(d.offsets) {
-		return nil, 0, nil
-	}
-	ofs := binary.BigEndian.Uint32(d.offsets[idx*4 : idx*4+4])
-	n, key := readKey(d.b[ofs:])
-
-	typ := d.b[int(ofs)+n]
-
-	var ie indexEntries
-	if entries != nil {
-		ie.entries = *entries
-	}
-	if _, err := readEntries(d.b[int(ofs)+n:], &ie); err != nil {
-		return nil, 0, nil
-	}
-	if entries != nil {
-		*entries = ie.entries
-	}
-
-	return key, typ, ie.entries
-}
-
-// KeyAt returns the key in the index at the given position.
-func (d *indirectIndex) KeyAt(idx int) ([]byte, byte) {
-	d.mu.RLock()
-
-	if idx < 0 || idx*4+4 > len(d.offsets) {
-		d.mu.RUnlock()
-		return nil, 0
-	}
-	ofs := int32(binary.BigEndian.Uint32(d.offsets[idx*4 : idx*4+4]))
-
-	n, key := readKey(d.b[ofs:])
-	ofs = ofs + int32(n)
-	typ := d.b[ofs]
-	d.mu.RUnlock()
-	return key, typ
+	return nil, nil
 }
 
 // KeyCount returns the count of unique keys in the index.
 func (d *indirectIndex) KeyCount() int {
 	d.mu.RLock()
-	n := len(d.offsets) / 4
+	n := int(d.tree.Count())
 	d.mu.RUnlock()
 	return n
+}
+
+// Iterator returns an iterator over the keys starting at the provided key. You must
+// call Next before calling any of the accessors.
+func (d *indirectIndex) Iterator(key []byte) *TSMIndexIterator {
+	d.mu.RLock()
+	iter := d.tree.Iterator()
+	_, ok := iter.Seek(key, d.b)
+
+	ti := &TSMIndexIterator{
+		d:     d,
+		n:     int(d.tree.Count()),
+		b:     d.b,
+		iter:  iter,
+		first: true,
+		ok:    ok,
+		ent:   iter.Entry(),
+	}
+	d.mu.RUnlock()
+
+	return ti
 }
 
 // Delete removes the given keys from the index.
@@ -901,44 +700,27 @@ func (d *indirectIndex) Delete(keys [][]byte) {
 		return
 	}
 
-	if !bytesutil.IsSorted(keys) {
-		bytesutil.Sort(keys)
-	}
-
-	// Both keys and offsets are sorted.  Walk both in order and skip
-	// any keys that exist in both.
 	d.mu.Lock()
-	start := d.searchOffset(keys[0])
-	for i := start * 4; i+4 <= len(d.offsets) && len(keys) > 0; i += 4 {
-		offset := binary.BigEndian.Uint32(d.offsets[i : i+4])
-		_, indexKey := readKey(d.b[offset:])
-
-		for len(keys) > 0 && bytes.Compare(keys[0], indexKey) < 0 {
-			keys = keys[1:]
+	iter := d.tree.Iterator()
+	for _, key := range keys {
+		// often, the passed in keys are contiguous. calling DeleteEntry advances
+		// the iterator, so just check if we're on the right key to avoid seeking.
+		if !iter.CheckKey(key, d.b) {
+			exact, _ := iter.Seek(key, d.b)
+			if !exact {
+				continue
+			}
 		}
 
-		if len(keys) > 0 && bytes.Equal(keys[0], indexKey) {
-			keys = keys[1:]
-			copy(d.offsets[i:i+4], nilOffset[:])
-		}
+		delete(d.tombstones, iter.Entry().Offset())
+		iter.DeleteEntry()
 	}
-	d.offsets = bytesutil.Pack(d.offsets, 4, 255)
 	d.mu.Unlock()
 }
 
 // DeleteRange removes the given keys with data between minTime and maxTime from the index.
 func (d *indirectIndex) DeleteRange(keys [][]byte, minTime, maxTime int64) {
-	// No keys, nothing to do
-	if len(keys) == 0 {
-		return
-	}
-
-	if !bytesutil.IsSorted(keys) {
-		bytesutil.Sort(keys)
-	}
-
-	// If we're deleting the max time range, just use tombstoning to remove the
-	// key from the offsets slice
+	// If we're deleting everything, we won't need to worry about partial deletes.
 	if minTime == math.MinInt64 && maxTime == math.MaxInt64 {
 		d.Delete(keys)
 		return
@@ -950,36 +732,71 @@ func (d *indirectIndex) DeleteRange(keys [][]byte, minTime, maxTime int64) {
 		return
 	}
 
-	fullKeys := make([][]byte, 0, len(keys))
-	tombstones := map[string][]TimeRange{}
+	// insertTombstone inserts a time range for the minTime and
+	// maxTime into the sorted list of tombstones. Sadly, we have
+	// to make a copy here in case of concurrent DeleteRange calls.
+	var tsc []TimeRange
+	insertTombstone := func(ts []TimeRange) []TimeRange {
+		n := sort.Search(len(ts), func(i int) bool {
+			if ts[i].Min == minTime {
+				return ts[i].Max >= maxTime
+			}
+			return ts[i].Min > minTime
+		})
+
+		if cap(tsc) < len(ts)+1 {
+			tsc = make([]TimeRange, 0, len(ts)+1)
+		}
+		tsc = append(tsc[:0], ts[:n]...)
+		tsc = append(tsc, TimeRange{minTime, maxTime})
+		tsc = append(tsc, ts[n:]...)
+		return tsc
+	}
+
+	// General outline:
+	// Under the read lock, determine the set of actions we need to
+	// take and on what keys to take them. Then, under the write
+	// lock, perform those actions. We keep track of some state
+	// during the read lock to make double checking under the
+	// write lock cheap.
+
+	// tombstones maps the index of the key to the desired list
+	// of sorted tombstones after the delete. As a special case,
+	// if the Ranges field is nil, that means that the key
+	// should be deleted.
+	type tombstoneEntry struct {
+		KeyOffset uint32
+		Ranges    []TimeRange
+	}
+
+	d.mu.RLock()
+	iter := d.tree.Iterator()
 	var entries []IndexEntry
-	var k []byte
+	var tombstones []tombstoneEntry
+	var err error
 
-	for i := 0; len(keys) > 0 && i < d.KeyCount(); i++ {
-		k, entries = d.readEntriesAt(d.offset(i), entries)
-
-		// Skip any keys that don't exist.  These are less than the current key.
-		for len(keys) > 0 && bytes.Compare(keys[0], k) < 0 {
-			keys = keys[1:]
+	for _, key := range keys {
+		// often, the passed in keys are contiguous. check the iterator's next entry to see
+		// if it matches the key to avoid a seek.
+		if !iter.Next() || !iter.CheckKey(key, d.b) {
+			exact, _ := iter.Seek(key, d.b)
+			if !exact {
+				continue
+			}
 		}
 
-		// No more keys to delete, we're done.
-		if len(keys) == 0 {
-			break
-		}
-
-		// If the current key is greater than the index one, continue to the next
-		// index key.
-		if len(keys) > 0 && bytes.Compare(keys[0], k) > 0 {
+		ent := iter.Entry()
+		keyOffset := ent.Offset()
+		entries, err = readEntries(d.b[ent.EntryOffset(d.b):], entries)
+		if err != nil {
+			// If we have an error reading the entries for a key, we should just pretend
+			// the whole key is deleted. Maybe a better idea is to report this up somehow
+			// but that's for another time.
+			tombstones = append(tombstones, tombstoneEntry{KeyOffset: keyOffset})
 			continue
 		}
 
-		// If multiple tombstones are saved for the same key
-		if len(entries) == 0 {
-			continue
-		}
-
-		// Is the time range passed outside of the time range we've have stored for this key?
+		// Is the time range passed outside of the time range we have stored for this key?
 		min, max := entries[0].MinTime, entries[len(entries)-1].MaxTime
 		if minTime > max || maxTime < min {
 			continue
@@ -987,108 +804,123 @@ func (d *indirectIndex) DeleteRange(keys [][]byte, minTime, maxTime int64) {
 
 		// Does the range passed in cover every value for the key?
 		if minTime <= min && maxTime >= max {
-			fullKeys = append(fullKeys, keys[0])
-			keys = keys[1:]
+			tombstones = append(tombstones, tombstoneEntry{KeyOffset: keyOffset})
 			continue
 		}
 
-		d.mu.RLock()
-		existing := d.tombstones[string(k)]
-		d.mu.RUnlock()
-
-		// Append the new tombonstes to the existing ones
-		newTs := append(existing, append(tombstones[string(k)], TimeRange{minTime, maxTime})...)
-		fn := func(i, j int) bool {
-			a, b := newTs[i], newTs[j]
-			if a.Min == b.Min {
-				return a.Max <= b.Max
-			}
-			return a.Min < b.Min
-		}
-
-		// Sort the updated tombstones if necessary
-		if len(newTs) > 1 && !sort.SliceIsSorted(newTs, fn) {
-			sort.Slice(newTs, fn)
-		}
-
-		tombstones[string(k)] = newTs
-
-		// We need to see if all the tombstones end up deleting the entire series.  This
-		// could happen if their is one tombstore with min,max time spanning all the block
-		// time ranges or from multiple smaller tombstones the delete segments.  To detect
-		// this cases, we use a window starting at the first tombstone and grow it be each
-		// tombstone that is immediately adjacent to the current window or if it overlaps.
-		// If there are any gaps, we abort.
-		minTs, maxTs := newTs[0].Min, newTs[0].Max
-		for j := 1; j < len(newTs); j++ {
-			prevTs := newTs[j-1]
-			ts := newTs[j]
-
-			// Make sure all the tombstone line up for a continuous range.  We don't
-			// want to have two small deletes on each edges end up causing us to
-			// remove the full key.
-			if prevTs.Max != ts.Min-1 && !prevTs.Overlaps(ts.Min, ts.Max) {
-				minTs, maxTs = int64(math.MaxInt64), int64(math.MinInt64)
-				break
-			}
-
-			if ts.Min < minTs {
-				minTs = ts.Min
-			}
-			if ts.Max > maxTs {
-				maxTs = ts.Max
-			}
-		}
-
-		// If we have a fully deleted series, delete it all of it.
-		if minTs <= min && maxTs >= max {
-			fullKeys = append(fullKeys, keys[0])
-			keys = keys[1:]
+		// Get the sorted list of tombstones with our new range and check
+		// to see if they fully cover the key's entries.
+		ts := insertTombstone(d.tombstones[keyOffset])
+		if timeRangesCoverEntries(ts, entries) {
+			tombstones = append(tombstones, tombstoneEntry{KeyOffset: keyOffset})
 			continue
 		}
-	}
 
-	// Delete all the keys that fully deleted in bulk
-	if len(fullKeys) > 0 {
-		d.Delete(fullKeys)
+		// We're adding a tombstone. Store a copy because `insertTombstone` reuses
+		// the same slice across calls.
+		tombstones = append(tombstones, tombstoneEntry{
+			KeyOffset: keyOffset,
+			Ranges:    append([]TimeRange(nil), ts...),
+		})
 	}
+	d.mu.RUnlock()
 
+	// Nothing in tombstones means no deletes are going to happen.
 	if len(tombstones) == 0 {
 		return
 	}
 
 	d.mu.Lock()
-	for k, v := range tombstones {
-		d.tombstones[k] = v
+	defer d.mu.Unlock()
+
+	// Reset the iterator in case it became invalid during
+	// modifications after dropping the read lock.
+	iter = d.tree.Iterator()
+
+	for _, tsEntry := range tombstones {
+		// often, the passed in keys are contiguous. check the iterator's next entry to see
+		// if it matches the key to avoid a seek.
+		if !iter.Next() || iter.Entry().Offset() != tsEntry.KeyOffset {
+			exact, _ := iter.SeekOffset(tsEntry.KeyOffset)
+			if !exact {
+				// Someone else already deleted this key. Clean
+				// up the tombstones map just in case.
+				delete(d.tombstones, tsEntry.KeyOffset)
+				continue
+			}
+		}
+
+		// If the desired list is nil, the key should be
+		// fully deleted.
+		if tsEntry.Ranges == nil {
+			delete(d.tombstones, tsEntry.KeyOffset)
+			iter.DeleteEntry()
+			continue
+		}
+
+		// Check the existing tombstones. If the length did not
+		// change, then we know that we don't need to double
+		// check coverage, since we only ever increase the
+		// number of tombstones for a key.
+		dts := d.tombstones[tsEntry.KeyOffset]
+		if len(dts) == len(tsEntry.Ranges)-1 {
+			d.tombstones[tsEntry.KeyOffset] = tsEntry.Ranges
+			continue
+		}
+
+		// Since the length changed, we have to do the expensive overlap check again.
+		// We re-read the entries again under the write lock because this should be
+		// rare and only during concurrent deletes to the same key. We could make
+		// a copy of the entries before getting here, but that penalizes the common
+		// no-concurrent case.
+		entries, err = readEntries(d.b[iter.Entry().EntryOffset(d.b):], entries)
+		if err != nil {
+			// If we have an error reading the entries for a key, we should just pretend
+			// the whole key is deleted. Maybe a better idea is to report this up somehow
+			// but that's for another time.
+			delete(d.tombstones, tsEntry.KeyOffset)
+			iter.DeleteEntry()
+			continue
+		}
+
+		ts := insertTombstone(dts)
+		if timeRangesCoverEntries(ts, entries) {
+			delete(d.tombstones, tsEntry.KeyOffset)
+			iter.DeleteEntry()
+		} else {
+			d.tombstones[tsEntry.KeyOffset] = append([]TimeRange(nil), ts...)
+		}
 	}
-	d.mu.Unlock()
 }
 
 // TombstoneRange returns ranges of time that are deleted for the given key.
 func (d *indirectIndex) TombstoneRange(key []byte) []TimeRange {
+	var r []TimeRange
 	d.mu.RLock()
-	r := d.tombstones[string(key)]
+	ent, exact := d.treeEntryLocked(key)
+	if exact {
+		r = d.tombstones[ent.Offset()]
+	}
 	d.mu.RUnlock()
 	return r
 }
 
 // Contains return true if the given key exists in the index.
 func (d *indirectIndex) Contains(key []byte) bool {
-	return len(d.Entries(key)) > 0
+	d.mu.RLock()
+	ok := d.tree.Has(key, d.b)
+	d.mu.RUnlock()
+	return ok
 }
 
 // ContainsValue returns true if key and time might exist in this file.
 func (d *indirectIndex) ContainsValue(key []byte, timestamp int64) bool {
-	entry := d.Entry(key, timestamp)
-	if entry == nil {
+	entry, err := d.Entry(key, timestamp)
+	if entry == nil || err != nil {
 		return false
 	}
 
-	d.mu.RLock()
-	tombstones := d.tombstones[string(key)]
-	d.mu.RUnlock()
-
-	for _, t := range tombstones {
+	for _, t := range d.TombstoneRange(key) {
 		if t.Min <= timestamp && t.Max >= timestamp {
 			return false
 		}
@@ -1098,16 +930,11 @@ func (d *indirectIndex) ContainsValue(key []byte, timestamp int64) bool {
 
 // Type returns the block type of the values stored for the key.
 func (d *indirectIndex) Type(key []byte) (byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	ofs := d.search(key)
-	if ofs < len(d.b) {
-		n, _ := readKey(d.b[ofs:])
-		ofs += n
-		return d.b[ofs], nil
+	ent, ok := d.treeEntry(key)
+	if !ok {
+		return 0, fmt.Errorf("key does not exist: %s", key)
 	}
-	return 0, fmt.Errorf("key does not exist: %s", key)
+	return d.b[ent.EntryOffset(d.b)], nil
 }
 
 // OverlapsTimeRange returns true if the time range of the file intersect min and max.
@@ -1150,33 +977,47 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 		return nil
 	}
 
-	//var minKey, maxKey []byte
+	var minKey, maxKey []byte
+	var bulk bptree.Bulk
 	var minTime, maxTime int64 = math.MaxInt64, 0
-
-	// To create our "indirect" index, we need to find the location of all the keys in
-	// the raw byte slice.  The keys are listed once each (in sorted order).  Following
-	// each key is a time ordered list of index entry blocks for that key.  The loop below
-	// basically skips across the slice keeping track of the counter when we are at a key
-	// field.
-	var i int32
-	var offsets []int32
-	iMax := int32(len(b))
+	var i uint32
+	iMax := uint32(len(b))
 	for i < iMax {
-		offsets = append(offsets, i)
-
-		// Skip to the start of the values
-		// key length value (2) + type (1) + length of key
+		// First two bytes are the key length
 		if i+2 >= iMax {
 			return fmt.Errorf("indirectIndex: not enough data for key length value")
 		}
-		i += 3 + int32(binary.BigEndian.Uint16(b[i:i+2]))
+		keyLen := uint32(binary.BigEndian.Uint16(b[i : i+2]))
 
-		// count of index entries
+		// Then the key follows
+		if i+2+keyLen >= iMax {
+			return fmt.Errorf("indirectIndex: not enough data for key")
+		}
+		key := b[i+2 : i+2+keyLen]
+
+		// Record minimum and maximum keys.
+		maxKey = key
+		if minKey == nil {
+			minKey = key
+		}
+
+		// Append the entry into our tree. The offset should be at the start of the entry.
+		bulk.Append(bptree.NewEntry(key, i))
+
+		// Advance the index. The byte after the key is the type.
+		i += 2 + keyLen + 1
+
+		// Next is the count of the index entries.
 		if i+indexCountSize >= iMax {
 			return fmt.Errorf("indirectIndex: not enough data for index entries count")
 		}
-		count := int32(binary.BigEndian.Uint16(b[i : i+indexCountSize]))
+		count := uint32(binary.BigEndian.Uint16(b[i : i+indexCountSize]))
 		i += indexCountSize
+
+		// There should always be at least one entry.
+		if count == 0 {
+			return fmt.Errorf("indirectIndex: key with no index entries")
+		}
 
 		// Find the min time for the block
 		if i+8 >= iMax {
@@ -1187,6 +1028,7 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 			minTime = minT
 		}
 
+		// Advance to the last block.
 		i += (count - 1) * indexEntrySize
 
 		// Find the max time for the block
@@ -1198,29 +1040,15 @@ func (d *indirectIndex) UnmarshalBinary(b []byte) error {
 			maxTime = maxT
 		}
 
+		// Advance to the next key.
 		i += indexEntrySize
 	}
 
-	firstOfs := offsets[0]
-	_, key := readKey(b[firstOfs:])
-	d.minKey = key
-
-	lastOfs := offsets[len(offsets)-1]
-	_, key = readKey(b[lastOfs:])
-	d.maxKey = key
-
+	d.minKey = minKey
+	d.maxKey = maxKey
 	d.minTime = minTime
 	d.maxTime = maxTime
-
-	var err error
-	d.offsets, err = mmap(nil, 0, len(offsets)*4)
-	if err != nil {
-		return err
-	}
-	for i, v := range offsets {
-		binary.BigEndian.PutUint32(d.offsets[i*4:i*4+4], uint32(v))
-	}
-
+	d.tree = bulk.Done()
 	return nil
 }
 
@@ -1232,12 +1060,9 @@ func (d *indirectIndex) Size() uint32 {
 	return uint32(len(d.b))
 }
 
+// Close .. closes the indirect index.
 func (d *indirectIndex) Close() error {
-	// Windows doesn't use the anonymous map for the offsets index
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	return munmap(d.offsets[:cap(d.offsets)])
+	return nil
 }
 
 // mmapAccess is mmap based block accessor.  It access blocks through an
@@ -1385,9 +1210,9 @@ func (m *mmapAccessor) rename(path string) error {
 }
 
 func (m *mmapAccessor) read(key []byte, timestamp int64) ([]Value, error) {
-	entry := m.index.Entry(key, timestamp)
-	if entry == nil {
-		return nil, nil
+	entry, err := m.index.Entry(key, timestamp)
+	if entry == nil || err != nil {
+		return nil, err
 	}
 
 	return m.readBlock(entry, nil)
@@ -1432,9 +1257,9 @@ func (m *mmapAccessor) readBytes(entry *IndexEntry, b []byte) (uint32, []byte, e
 func (m *mmapAccessor) readAll(key []byte) ([]Value, error) {
 	m.incAccess()
 
-	blocks := m.index.Entries(key)
-	if len(blocks) == 0 {
-		return nil, nil
+	blocks, err := m.index.Entries(key)
+	if len(blocks) == 0 || err != nil {
+		return nil, err
 	}
 
 	tombstones := m.index.TombstoneRange(key)
@@ -1443,7 +1268,6 @@ func (m *mmapAccessor) readAll(key []byte) ([]Value, error) {
 	defer m.mu.RUnlock()
 
 	var temp []Value
-	var err error
 	var values []Value
 	for _, block := range blocks {
 		var skip bool
@@ -1507,29 +1331,53 @@ func readEntries(b []byte, entries []IndexEntry) ([]IndexEntry, error) {
 		return nil, errors.New("readEntries: data too short for headers")
 	}
 
-	// 1 byte block type
-	entries.Type = b[n]
-	n++
-
 	// 2 byte count of index entries
-	count := int(binary.BigEndian.Uint16(b[n : n+indexCountSize]))
-	n += indexCountSize
-
-	if cap(entries.entries) < count {
-		entries.entries = make([]IndexEntry, count)
+	count := int(binary.BigEndian.Uint16(b[indexTypeSize : indexTypeSize+indexCountSize]))
+	if cap(entries) < count {
+		entries = make([]IndexEntry, count)
 	} else {
-		entries.entries = entries.entries[:count]
+		entries = entries[:count]
 	}
 
 	b = b[indexCountSize+indexTypeSize:]
-	for i := 0; i < len(entries.entries); i++ {
-		if err = entries.entries[i].UnmarshalBinary(b); err != nil {
-			return 0, fmt.Errorf("readEntries: unmarshal error: %v", err)
+	for i := 0; i < len(entries); i++ {
+		if err := entries[i].UnmarshalBinary(b); err != nil {
+			return nil, err
 		}
 		b = b[indexEntrySize:]
 	}
 
-	n += count * indexEntrySize
+	return entries, nil
+}
 
-	return
+// timeRangesCoverEntries returns true if the time ranges fully cover the entries.
+func timeRangesCoverEntries(ts []TimeRange, entries []IndexEntry) (covers bool) {
+	mustCover := entries[0].MinTime
+	for len(entries) > 0 && len(ts) > 0 {
+		switch {
+		// If the tombstone does not include mustCover, we
+		// know we do not fully cover every entry.
+		case ts[0].Min > mustCover:
+			return false
+
+		// Otherwise, if the tombstone covers the rest of
+		// the entry, consume it and bump mustCover to the
+		// start of the next entry.
+		case ts[0].Max >= entries[0].MaxTime:
+			entries = entries[1:]
+			if len(entries) > 0 {
+				mustCover = entries[0].MinTime
+			}
+
+		// Otherwise, we're still inside of an entry, and
+		// so the tombstone must adjoin the current tombstone.
+		default:
+			if ts[0].Max >= mustCover {
+				mustCover = ts[0].Max + 1
+			}
+			ts = ts[1:]
+		}
+	}
+
+	return len(entries) == 0
 }
