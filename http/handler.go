@@ -22,8 +22,6 @@ import (
 const (
 	// MetricsPath exposes the prometheus metrics over /metrics.
 	MetricsPath = "/metrics"
-	// ReadyPath exposes the readiness of the service over /ready.
-	ReadyPath = "/ready"
 	// HealthPath exposes the health of the service over /health.
 	HealthPath = "/health"
 	// DebugPath exposes /debug/pprof for go debugging.
@@ -36,8 +34,6 @@ type Handler struct {
 	name string
 	// MetricsHandler handles metrics requests
 	MetricsHandler http.Handler
-	// ReadyHandler handles readiness checks
-	ReadyHandler http.Handler
 	// HealthHandler handles health requests
 	HealthHandler http.Handler
 	// DebugHandler handles debug requests
@@ -78,7 +74,6 @@ func NewHandlerFromRegistry(name string, reg *prom.Registry) *Handler {
 	h := &Handler{
 		name:           name,
 		MetricsHandler: reg.HTTPHandler(),
-		ReadyHandler:   http.HandlerFunc(ReadyHandler),
 		HealthHandler:  http.HandlerFunc(HealthHandler),
 		DebugHandler:   http.DefaultServeMux,
 	}
@@ -156,8 +151,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == MetricsPath:
 		h.MetricsHandler.ServeHTTP(w, r)
-	case r.URL.Path == ReadyPath:
-		h.ReadyHandler.ServeHTTP(w, r)
 	case r.URL.Path == HealthPath:
 		h.HealthHandler.ServeHTTP(w, r)
 	case strings.HasPrefix(r.URL.Path, DebugPath):
